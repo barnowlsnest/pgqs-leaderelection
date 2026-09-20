@@ -4,15 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+The repo uses [Task](https://taskfile.dev); prefer it over raw `go` commands so lint and test flags stay consistent.
+
 ```bash
-go build ./...
-go test ./...                                    # requires a running Docker daemon (testcontainers)
-go test ./pkg/pgleader -run TestServiceSuite      # one suite
-go test ./pkg/pgleader -run 'TestServiceSuite/TestRunElectsSingleLeader' -v   # one test in a suite
-golangci-lint run                                 # config in .golangci.yaml
+task build
+task test     # go clean -testcache && go test -v -race -timeout 5m ./...
+task lint     # go vet, go fmt, goimports, golangci-lint run --fix
+task update   # go mod tidy with GOPRIVATE set for github.com/barnowlsnest/*
 ```
 
-Tests are testify suites backed by a real `postgres:16-alpine` testcontainer, one container per suite (`SetupSuite`). There are no unit-only tests; anything touching `pgleader` needs Docker.
+`task test` requires a running Docker daemon — every test spins up a `postgres:16-alpine` testcontainer, one per suite (`SetupSuite`). There are no unit-only tests.
+
+To narrow a run (testify suites, so the subtest name is part of the path):
+
+```bash
+go test ./pkg/pgleader -run TestServiceSuite
+go test ./pkg/pgleader -run 'TestServiceSuite/TestRunElectsSingleLeader' -v
+```
 
 ## Architecture
 
@@ -34,6 +42,7 @@ Library (no `main`) providing PostgreSQL-backed leader election. Two packages:
 - **`HashKey` reinterprets, never truncates.** `int64(murmur3.Sum64(...))` is a bit-for-bit conversion (hence the `gosec` nolint); ~half the keys are negative and that is correct.
 - **One `Run` loop per resource per `Service`.** `beginRun`/`endRun` register terms in `Service.terms`; a second concurrent `Run` gets `ErrRunInProgress`.
 - **Expiry is compared against `Service.now`**, not the database clock — `WithClock` exists so tests can advance time instead of sleeping.
+- **Nothing is swallowed.** Errors on paths that cannot return one (deferred unlocks, shutdown release, the campaign loop) are logged through `go-logslib/v2/pkg/sharedlog`, the same logger the harness uses. Do not reintroduce `_ =` on an error.
 - Sentinel errors are exported and compared with `errors.Is`; callers distinguish "not leader right now" (`ErrLeaseHeldByOther`, `ErrLockAlreadyAcquired`) from real failures.
 
 ## Conventions
