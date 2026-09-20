@@ -1,1 +1,1 @@
-DROP TABLE IF EXISTS leases;
+DROP TABLE IF EXISTS pgqs.leases;
