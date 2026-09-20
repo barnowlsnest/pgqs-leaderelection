@@ -57,8 +57,15 @@ type (
 	// Callbacks are invoked by Run as leadership changes. Both are optional.
 	Callbacks struct {
 		// OnElected runs in its own goroutine once this process becomes leader.
-		// Its context is canceled as soon as leadership is lost or Run returns,
-		// so leader-only work must honor it.
+		// Its context is canceled when leadership is lost, when the lease
+		// expires without a successful renewal, or when Run returns, so
+		// leader-only work must honor it.
+		//
+		// Cancellation bounds this process's belief that it leads; it cannot
+		// bound the work already in flight. A process frozen past its lease
+		// expiry keeps running until it thaws, by which time another process may
+		// hold the lease. Work that must never overlap has to be fenced at the
+		// resource it writes, using LeaseRecord.Version as the fencing token.
 		OnElected func(ctx context.Context)
 		// OnResigned runs after leadership is lost, once the OnElected context
 		// has been canceled.
@@ -340,19 +347,12 @@ func (s *Service) Run(ctx context.Context, resource string, cb Callbacks) error 
 // already hold stays valid until its recorded expiry, so the loop keeps leading
 // and retries. Resigning on the first transient error would hand leadership
 // back and forth whenever a challenger polls.
+//
+// The expiry itself is enforced by a timer on the term, not by this loop, so a
+// renewal that hangs cannot keep the term alive past the lease.
 func (s *Service) campaign(ctx context.Context, resource string, t *term, cb Callbacks) {
 	if t.leading.Load() {
-		rec, err := s.Renew(ctx, resource)
-		switch {
-		case err == nil:
-			t.expiry = rec.ExpiresAt
-		case errors.Is(err, ErrLeaseLost), !s.now().Before(t.expiry):
-			log.Error(fmt.Errorf("renewing lease, resigning: %w", err), s.fields(resource)...)
-			s.resign(t, cb)
-		default:
-			log.Warn("lease renewal failed, still leading until expiry",
-				append(s.fields(resource), logger.StringField("error", err.Error()))...)
-		}
+		s.renewTerm(ctx, resource, t, cb)
 
 		return
 	}
@@ -367,10 +367,45 @@ func (s *Service) campaign(ctx context.Context, resource string, t *term, cb Cal
 		return
 	}
 
-	t.expiry = rec.ExpiresAt
-	leaderCtx := t.begin(ctx)
+	leaderCtx := s.beginTerm(ctx, t, rec.ExpiresAt, cb)
 	if cb.OnElected != nil {
 		go cb.OnElected(leaderCtx)
+	}
+}
+
+// renewTerm performs one renewal of a lease this loop holds.
+//
+// The call is bounded by the lease's own remaining lifetime. A renewal still in
+// flight when the lease expires cannot save the term, and letting it block the
+// loop indefinitely would leave OnElected running with nobody watching the
+// clock.
+func (s *Service) renewTerm(ctx context.Context, resource string, t *term, cb Callbacks) {
+	remaining := t.remaining(s.now())
+	if remaining <= 0 {
+		s.resign(t, cb)
+
+		return
+	}
+
+	renewCtx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+
+	rec, err := s.Renew(renewCtx, resource)
+	switch {
+	case err == nil:
+		if !t.leading.Load() {
+			// The expiry timer ended the term while this renewal was in flight.
+			// The row is extended but we no longer lead; the next loop iteration
+			// reacquires it, since the holder is still this identity.
+			return
+		}
+		t.extend(rec.ExpiresAt, s.now(), s.expireTerm(t, cb))
+	case errors.Is(err, ErrLeaseLost), !s.now().Before(t.deadline()):
+		log.Error(fmt.Errorf("renewing lease, resigning: %w", err), s.fields(resource)...)
+		s.resign(t, cb)
+	default:
+		log.Warn("lease renewal failed, still leading until expiry",
+			append(s.fields(resource), logger.StringField("error", err.Error()))...)
 	}
 }
 
@@ -400,34 +435,118 @@ func (s *Service) endRun(resource string) {
 }
 
 // term is the leadership state of a single Run loop: whether that loop holds
-// the lease, when the lease it holds runs out, and the cancel func of the
-// context handed to OnElected. leading is atomic because IsLeader reads it from
-// other goroutines; stop and expiry are touched only by the owning Run
-// goroutine.
+// the lease, when the lease it holds runs out, the cancel func of the context
+// handed to OnElected, and the timer that enforces the expiry.
+//
+// leading is atomic because IsLeader reads it from other goroutines. The
+// remaining fields are guarded by mu, because the expiry timer fires on its own
+// goroutine and races the owning Run goroutine.
 type term struct {
 	leading atomic.Bool
-	stop    context.CancelFunc
-	expiry  time.Time
+
+	mu     sync.Mutex
+	stop   context.CancelFunc
+	expiry time.Time
+	timer  *time.Timer
 }
 
-// begin marks the start of a leadership term and derives its leader context.
-func (t *term) begin(ctx context.Context) context.Context {
+// beginTerm marks the start of a leadership term, derives its leader context and
+// arms the expiry timer.
+func (s *Service) beginTerm(ctx context.Context, t *term, expiry time.Time, cb Callbacks) context.Context {
 	leaderCtx, stop := context.WithCancel(ctx)
+
+	t.mu.Lock()
 	t.stop = stop
+	t.expiry = expiry
+	t.timer = time.AfterFunc(expiry.Sub(s.now()), s.expireTerm(t, cb))
+	t.mu.Unlock()
+
 	t.leading.Store(true)
 
 	return leaderCtx
 }
 
-// resign cancels the leader context and reports the loss exactly once per term.
+// expireTerm builds the expiry-timer callback. It ends the term the moment the
+// lease runs out, without waiting for the Run loop to come back round: a
+// renewal that hangs on a dead connection must not leave OnElected running past
+// the point where another process may take the lease over.
+//
+// A renewal that landed while the timer was already queued has pushed the
+// expiry out, so the callback re-arms instead of resigning.
+func (s *Service) expireTerm(t *term, cb Callbacks) func() {
+	return func() {
+		if t.rearm(s.now()) {
+			return
+		}
+
+		log.Warn("lease expired without a successful renewal, resigning",
+			logger.StringField("identity", s.identity))
+		s.resign(t, cb)
+	}
+}
+
+// deadline reports when the held lease runs out.
+func (t *term) deadline() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.expiry
+}
+
+// remaining reports how much of the held lease is left as of now.
+func (t *term) remaining(now time.Time) time.Duration {
+	return t.deadline().Sub(now)
+}
+
+// extend records a renewed expiry and pushes the expiry timer out to match.
+func (t *term) extend(expiry, now time.Time, onExpire func()) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.expiry = expiry
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.timer = time.AfterFunc(expiry.Sub(now), onExpire)
+}
+
+// rearm reports whether the term outlived a fired expiry timer, re-arming the
+// timer for the new expiry when it did.
+func (t *term) rearm(now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	left := t.expiry.Sub(now)
+	if left <= 0 {
+		return false
+	}
+	if t.timer != nil {
+		t.timer.Reset(left)
+	}
+
+	return true
+}
+
+// resign ends a leadership term exactly once: it disarms the expiry timer,
+// cancels the leader context and reports the loss. It is called both from the
+// Run goroutine and from the expiry timer, so the atomic swap is what makes it
+// exactly-once.
 func (s *Service) resign(t *term, cb Callbacks) {
 	if !t.leading.Swap(false) {
 		return
 	}
 
-	if t.stop != nil {
-		t.stop()
-		t.stop = nil
+	t.mu.Lock()
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
+	stop := t.stop
+	t.stop = nil
+	t.mu.Unlock()
+
+	if stop != nil {
+		stop()
 	}
 	if cb.OnResigned != nil {
 		cb.OnResigned()

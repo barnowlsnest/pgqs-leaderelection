@@ -612,3 +612,98 @@ func (s *ServiceSuite) awaitFired(sig *signal, what string) {
 		s.FailNowf("timed out", "%s was never called", what)
 	}
 }
+
+// hangingRepo delegates to a real repo but blocks every Update until release is
+// closed, deliberately ignoring the context. It stands in for a renewal stuck on
+// a dead connection, where cancellation alone does not get control back.
+type hangingRepo struct {
+	inner   pgleader.LeaseRecordsRepo
+	release chan struct{}
+	hung    chan struct{}
+	once    sync.Once
+}
+
+func newHangingRepo(inner pgleader.LeaseRecordsRepo) *hangingRepo {
+	return &hangingRepo{
+		inner:   inner,
+		release: make(chan struct{}),
+		hung:    make(chan struct{}),
+	}
+}
+
+func (r *hangingRepo) Create(ctx context.Context, lease *pgleader.LeaseRecord) (*pgleader.LeaseRecord, error) {
+	return r.inner.Create(ctx, lease)
+}
+
+func (r *hangingRepo) Read(ctx context.Context, key int64) (*pgleader.LeaseRecord, error) {
+	return r.inner.Read(ctx, key)
+}
+
+func (r *hangingRepo) Delete(ctx context.Context, key int64) error {
+	return r.inner.Delete(ctx, key)
+}
+
+func (r *hangingRepo) Update(ctx context.Context, lease *pgleader.LeaseRecord) (*pgleader.LeaseRecord, error) {
+	r.once.Do(func() { close(r.hung) })
+	<-r.release
+
+	return r.inner.Update(ctx, lease)
+}
+
+// TestRun_expiryCancelsLeaderContextWhileRenewalHangs pins the guarantee that
+// the leader context dies with the lease. The renewal never returns, so the Run
+// loop cannot notice the expiry; only the term's own timer can.
+func (s *ServiceSuite) TestRun_expiryCancelsLeaderContextWhileRenewalHangs() {
+	const resource = "hung-renew"
+
+	repo := newHangingRepo(s.repo)
+	svc, err := pgleader.New(s.pool, repo, "node-hung",
+		pgleader.WithClock(time.Now),
+		pgleader.WithTTL(time.Second),
+		pgleader.WithRenewInterval(100*time.Millisecond),
+		pgleader.WithRetryInterval(testRetry),
+	)
+	s.Require().NoError(err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	elected, resigned := newSignal(), newSignal()
+	leaderCtx := make(chan context.Context, 1)
+
+	done := s.runAsync(ctx, svc, resource, pgleader.Callbacks{
+		OnElected: func(lctx context.Context) {
+			leaderCtx <- lctx
+			elected.fire()
+		},
+		OnResigned: resigned.fire,
+	})
+
+	s.awaitFired(elected, "OnElected")
+	lctx := <-leaderCtx
+
+	// The loop is now stuck inside the renewal and stays stuck.
+	select {
+	case <-repo.hung:
+	case <-time.After(testWait):
+		s.FailNow("timed out", "renewal was never attempted")
+	}
+
+	select {
+	case <-lctx.Done():
+	case <-time.After(testWait):
+		s.FailNow("timed out", "leader context outlived the lease while the renewal hung")
+	}
+	s.awaitFired(resigned, "OnResigned")
+	s.False(svc.IsLeader(resource), "still reports leadership after the lease expired")
+
+	close(repo.release)
+	cancel()
+
+	select {
+	case runErr := <-done:
+		s.Require().ErrorIs(runErr, context.Canceled)
+	case <-time.After(testWait):
+		s.FailNow("timed out", "Run did not return")
+	}
+}

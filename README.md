@@ -132,6 +132,8 @@ svc, err := pgleader.New(pool, leases, identity,
 | `WithRetryInterval` | 5s | Lower means faster failover and more polling. |
 | `WithClock` | `time.Now` | Test seam. Expiry is compared against this clock, not the database clock. |
 
+The `OnElected` context is canceled at the lease expiry if a renewal has not landed by then, so leader-only work stops on its own when the lease does.
+
 Pick `renewInterval` so that `TTL` covers several renewals: at 15s/5s a leader survives two consecutive failed renewals before it gives up leadership.
 
 ## Manual control
@@ -156,8 +158,42 @@ Errors are sentinels, compared with `errors.Is`:
 
 ## Guarantees and limits
 
-- **Mutual exclusion holds at the database.** Two processes cannot write conflicting decisions to the same lease row, because the advisory lock serializes the read-decide-write cycle.
-- **Leadership is eventually consistent in your process.** `IsLeader` and the `OnElected` context reflect the last successful renewal, not this instant. Between a leader being partitioned and its `OnElected` context being canceled, it may still believe it leads. This is inherent to lease-based election, not specific to this library — **if your leader-only work must never overlap, fence it**: use the lease `Version`, which increments on every acquire and renew, as a fencing token on whatever the work writes.
+**One lease holder at a time — guaranteed.** The advisory lock serializes the read-decide-write cycle on the lease row, so two candidates can never both conclude they won. This holds under any failure.
+
+**One *worker* at a time — not guaranteed by any lease system, including this one.** `IsLeader` and the `OnElected` context live in your process's memory. A frozen process cannot be told it is no longer leader:
+
+```
+t=0s     A acquires. expires_at = 15s. OnElected starts writing.
+t=3s     A's host freezes — GC pause, CPU steal, VM suspend, partition.
+t=15s    The lease expires in the database.
+t=15.1s  B sees an expired lease, takes over, starts writing.
+t=17s    A thaws. It has not yet learned anything, so it is still writing.
+         ← two writers
+t=17.1s  A's renewal fails, its leader context is canceled, A stops.
+```
+
+The database was never wrong; the lease had exactly one valid holder throughout. What was stale was A's *belief*. This window is inherent to leases — etcd, ZooKeeper, Consul and Kubernetes `Lease` objects all have it.
+
+This library makes the window as small as it can be:
+
+- The leader context is canceled by a **timer armed at the lease expiry**, independent of the renewal loop. A renewal stuck on a dead connection cannot keep the term alive past the lease.
+- Renewals are bounded by the lease's own remaining lifetime, so a hung call cannot stall the loop.
+
+What it cannot do is stop code already running in a frozen process. **If your leader-only work must never overlap, fence it at the resource.** `LeaseRecord.Version` increments on every acquire and renew, so it is monotonic — carry it into the write and let the target reject stale writers:
+
+```sql
+UPDATE report_state
+   SET data = $1, fence = $2      -- $2 = Version from your lease
+ WHERE report_id = $3
+   AND fence < $2;                -- a zombie leader's older Version updates 0 rows
+```
+
+In the timeline above, A resumes and writes with `fence = 4`; B already wrote `fence = 5`; A's UPDATE matches no rows. Two leaders existed, one write landed.
+
+If your leader-only work is idempotent or self-correcting — a cache warmer, a scraper, a job that re-reads before acting — you do not need this.
+
+### Other limits
+
 - **Expiry uses the process clock**, not the database clock. Badly skewed clocks across the fleet shorten or stretch effective TTLs; run NTP.
 - **Graceful shutdown is fast.** When `Run` returns it releases the lease, so a rolling deploy fails over immediately instead of waiting out the TTL. A `kill -9` waits for expiry.
 - `Release` on a lease held by someone else is a no-op, not an error.
