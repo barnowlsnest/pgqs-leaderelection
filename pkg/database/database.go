@@ -4,7 +4,7 @@ import (
 	"context"
 	"embed"
 	
-	"github.com/barnowlsnest/pgqs-harness/db"
+	"github.com/barnowlsnest/pgqs-harness/v2/db"
 )
 
 //go:embed migrations/*.sql

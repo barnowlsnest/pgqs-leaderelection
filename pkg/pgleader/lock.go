@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-
-	"github.com/barnowlsnest/pgqs-harness/postgres"
+	
+	"github.com/barnowlsnest/pgqs-harness/v2/postgres"
 )
 
 var (
@@ -34,12 +34,12 @@ func AcquireLock(ctx context.Context, pool *postgres.DBPool, key int64) (*Lock, 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("context error before acquiring lock: %w", err)
 	}
-
+	
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, ErrFailedAcquireConn
 	}
-
+	
 	var acquired bool
 	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&acquired); err != nil {
 		defer conn.Release()
@@ -49,7 +49,7 @@ func AcquireLock(ctx context.Context, pool *postgres.DBPool, key int64) (*Lock, 
 		defer conn.Release()
 		return nil, fmt.Errorf("%w: lock %d", ErrLockAlreadyAcquired, key)
 	}
-
+	
 	return &Lock{
 		key:  key,
 		conn: conn,
@@ -63,7 +63,7 @@ func (l *Lock) Release(ctx context.Context) error {
 	l.releaseOnce.Do(func() {
 		defer l.conn.Release()
 		l.released.Store(true)
-
+		
 		var released bool
 		if err := l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, l.key).Scan(&released); err != nil {
 			l.releaseErr = fmt.Errorf("%w: lock %d: %v", ErrFailedToReleaseLock, l.key, err)
@@ -73,7 +73,7 @@ func (l *Lock) Release(ctx context.Context) error {
 			l.releaseErr = fmt.Errorf("%w: lock %d", ErrLockNotHeld, l.key)
 		}
 	})
-
+	
 	return l.releaseErr
 }
 

@@ -1,11 +1,9 @@
 CREATE TABLE IF NOT EXISTS leases (
-    id BIGSERIAL PRIMARY KEY,
-    resource TEXT NOT NULL,
-    holder TEXT NOT NULL,
-    fence BIGINT NOT NULL DEFAULT 0,
-    acquired_at TIMESTAMPTZ NOT NULL,
-    acquired_until TIMESTAMPTZ NOT NULL,
-    UNIQUE (resource)
+    hash_key           bigint      PRIMARY KEY,
+    holder             text        NOT NULL,
+    version            bigint      NOT NULL DEFAULT 1,
+    acquired_at        timestamptz NOT NULL DEFAULT now(),
+    renewed_at         timestamptz NOT NULL DEFAULT now(),
+    expires_at         timestamptz NOT NULL,
+    metadata           jsonb
 );
-
-CREATE INDEX IF NOT EXISTS idx_leases_acquired_until ON leases (acquired_until);
