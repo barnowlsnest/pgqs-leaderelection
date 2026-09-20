@@ -3,6 +3,7 @@ module github.com/barnowlsnest/pgqs-leaderelection
 go 1.27
 
 require (
+	github.com/barnowlsnest/go-logslib/v2 v2.2.0
 	github.com/barnowlsnest/pgqs-harness/v2 v2.2.2
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/stretchr/testify v1.12.1
@@ -16,7 +17,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/barnowlsnest/go-asynctasklib/v2 v2.3.0 // indirect
 	github.com/barnowlsnest/go-configlib/v2 v2.0.0 // indirect
-	github.com/barnowlsnest/go-logslib/v2 v2.2.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect

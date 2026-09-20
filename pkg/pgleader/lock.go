@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/barnowlsnest/go-logslib/v2/pkg/logger"
+	log "github.com/barnowlsnest/go-logslib/v2/pkg/sharedlog"
 	"github.com/barnowlsnest/pgqs-harness/v2/postgres"
 )
 
@@ -104,7 +106,10 @@ func (l *Lock) discard(ctx context.Context) {
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
 	defer cancel()
 
-	_ = conn.Close(closeCtx)
+	if err := conn.Close(closeCtx); err != nil {
+		log.Error(fmt.Errorf("closing connection of stranded advisory lock: %w", err),
+			logger.Int64Field("lock_key", l.key))
+	}
 }
 
 // IsHeld reports whether the lock is still held by this process, i.e. Release

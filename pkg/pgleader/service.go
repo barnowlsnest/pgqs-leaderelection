@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/barnowlsnest/go-logslib/v2/pkg/logger"
+	log "github.com/barnowlsnest/go-logslib/v2/pkg/sharedlog"
 	"github.com/barnowlsnest/pgqs-harness/v2/db"
 	"github.com/barnowlsnest/pgqs-harness/v2/postgres"
 	"github.com/twmb/murmur3"
@@ -345,7 +347,11 @@ func (s *Service) campaign(ctx context.Context, resource string, t *term, cb Cal
 		case err == nil:
 			t.expiry = rec.ExpiresAt
 		case errors.Is(err, ErrLeaseLost), !s.now().Before(t.expiry):
+			log.Error(fmt.Errorf("renewing lease, resigning: %w", err), s.fields(resource)...)
 			s.resign(t, cb)
+		default:
+			log.Warn("lease renewal failed, still leading until expiry",
+				append(s.fields(resource), logger.StringField("error", err.Error()))...)
 		}
 
 		return
@@ -353,6 +359,11 @@ func (s *Service) campaign(ctx context.Context, resource string, t *term, cb Cal
 
 	rec, err := s.TryAcquire(ctx, resource)
 	if err != nil {
+		if !errors.Is(err, ErrLeaseHeldByOther) && !errors.Is(err, ErrLockAlreadyAcquired) {
+			log.Warn("acquiring lease failed",
+				append(s.fields(resource), logger.StringField("error", err.Error()))...)
+		}
+
 		return
 	}
 
@@ -432,7 +443,9 @@ func unlock(ctx context.Context, lock *Lock) {
 	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
 	defer cancel()
 
-	_ = lock.Release(unlockCtx)
+	if err := lock.Release(unlockCtx); err != nil {
+		log.Error(fmt.Errorf("releasing advisory lock: %w", err), logger.Int64Field("lock_key", lock.Key()))
+	}
 }
 
 // releaseOnShutdown drops the lease on a fresh context, because Run only returns
@@ -441,7 +454,18 @@ func (s *Service) releaseOnShutdown(resource string) {
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
 
-	_ = s.Release(ctx, resource)
+	if err := s.Release(ctx, resource); err != nil {
+		log.Error(fmt.Errorf("releasing lease on shutdown: %w", err),
+			logger.StringField("resource", resource), logger.StringField("identity", s.identity))
+	}
+}
+
+// fields are the log fields identifying a campaign.
+func (s *Service) fields(resource string) []logger.Field {
+	return []logger.Field{
+		logger.StringField("resource", resource),
+		logger.StringField("identity", s.identity),
+	}
 }
 
 func (s *Service) interval(t *term) time.Duration {
