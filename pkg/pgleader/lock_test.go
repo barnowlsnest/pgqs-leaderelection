@@ -196,16 +196,40 @@ func (s *LockSuite) TestAcquireLock_poolClosed() {
 	s.Nil(lock)
 }
 
+// A canceled context means the unlock never reaches the server, so the session
+// still holds the lock. That connection must not go back into the pool: an
+// advisory lock is session-scoped and reentrant, so a later borrower would
+// silently inherit it. Release discards the connection instead, and closing the
+// session is what makes PostgreSQL drop the lock.
 func (s *LockSuite) TestRelease_contextCanceled() {
 	const key int64 = 700_008
 
 	lock := s.acquire(key)
+	total := s.pool.Stat().TotalConns()
 
 	err := lock.Release(canceledCtx())
 	s.Require().ErrorIs(err, pgleader.ErrFailedToReleaseLock)
+	s.False(lock.IsHeld())
 
-	// Release still returned the connection to the pool; the server drops the
-	// session lock once that connection is reused/closed.
+	s.Eventuallyf(func() bool {
+		return s.pool.Stat().TotalConns() < total
+	}, 5*time.Second, 10*time.Millisecond,
+		"connection with a stranded lock was returned to the pool (total conns still %d)", total)
+
+	// With that session gone, the key is free for everyone else.
+	s.assertLockFree(key)
+}
+
+// The happy path must not throw connections away.
+func (s *LockSuite) TestRelease_keepsConnectionWhenUnlockSucceeds() {
+	const key int64 = 700_012
+
+	lock := s.acquire(key)
+	total := s.pool.Stat().TotalConns()
+
+	s.Require().NoError(lock.Release(s.T().Context()))
+	s.Equal(total, s.pool.Stat().TotalConns())
+	s.assertLockFree(key)
 }
 
 func (s *LockSuite) TestKey_returnsAcquiredKey() {

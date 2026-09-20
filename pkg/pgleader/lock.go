@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	
+	"time"
+
 	"github.com/barnowlsnest/pgqs-harness/v2/postgres"
 )
+
+// discardTimeout bounds closing a connection whose advisory lock could not be
+// released.
+const discardTimeout = 5 * time.Second
 
 var (
 	ErrFailedToAcquireLock = errors.New("failed to acquire advisory lock")
@@ -34,12 +39,12 @@ func AcquireLock(ctx context.Context, pool *postgres.DBPool, key int64) (*Lock, 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("context error before acquiring lock: %w", err)
 	}
-	
+
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, ErrFailedAcquireConn
 	}
-	
+
 	var acquired bool
 	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&acquired); err != nil {
 		defer conn.Release()
@@ -49,7 +54,7 @@ func AcquireLock(ctx context.Context, pool *postgres.DBPool, key int64) (*Lock, 
 		defer conn.Release()
 		return nil, fmt.Errorf("%w: lock %d", ErrLockAlreadyAcquired, key)
 	}
-	
+
 	return &Lock{
 		key:  key,
 		conn: conn,
@@ -59,22 +64,47 @@ func AcquireLock(ctx context.Context, pool *postgres.DBPool, key int64) (*Lock, 
 // Release releases the advisory lock and returns the connection to the pool. It
 // is safe to call Release multiple times: the unlock runs once and every call
 // returns the same result.
+//
+// If the unlock statement itself fails, the connection is discarded instead of
+// being returned. The lock is session-scoped, so a session that still holds it
+// would keep holding it for every later borrower of that pooled connection.
 func (l *Lock) Release(ctx context.Context) error {
 	l.releaseOnce.Do(func() {
-		defer l.conn.Release()
 		l.released.Store(true)
-		
+
 		var released bool
 		if err := l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, l.key).Scan(&released); err != nil {
 			l.releaseErr = fmt.Errorf("%w: lock %d: %v", ErrFailedToReleaseLock, l.key, err)
+			l.discard(ctx)
+
 			return
 		}
+
+		// The statement reached the server, so this session holds nothing any
+		// more and the connection is safe to reuse. A false result means the
+		// lock was never ours to release.
+		defer l.conn.Release()
+
 		if !released {
 			l.releaseErr = fmt.Errorf("%w: lock %d", ErrLockNotHeld, l.key)
 		}
 	})
-	
+
 	return l.releaseErr
+}
+
+// discard removes the connection from the pool and closes it. Closing the
+// session is what makes PostgreSQL drop the advisory lock; handing the
+// connection back would strand the lock on it indefinitely.
+func (l *Lock) discard(ctx context.Context) {
+	conn := l.conn.Hijack()
+
+	// ctx is routinely the very context whose cancellation broke the unlock, so
+	// close on a detached one.
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+	defer cancel()
+
+	_ = conn.Close(closeCtx)
 }
 
 // IsHeld reports whether the lock is still held by this process, i.e. Release

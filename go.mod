@@ -3,10 +3,11 @@ module github.com/barnowlsnest/pgqs-leaderelection
 go 1.27
 
 require (
-	github.com/barnowlsnest/pgqs-harness/v2 v2.0.1
+	github.com/barnowlsnest/pgqs-harness/v2 v2.2.2
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
+	github.com/twmb/murmur3 v1.2.0
 )
 
 require (

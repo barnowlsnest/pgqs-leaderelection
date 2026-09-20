@@ -3,7 +3,7 @@ package database
 import (
 	"context"
 	"embed"
-	
+
 	"github.com/barnowlsnest/pgqs-harness/v2/db"
 )
 
