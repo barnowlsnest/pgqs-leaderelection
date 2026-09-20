@@ -1,0 +1,29 @@
+# https://taskfile.dev
+
+version: '3'
+
+env:
+  MODULE_PATH: github.com/barnowlsnest/pgqs-leaderelection
+
+tasks:
+  update:
+    env:
+      GOPRIVATE: github.com/barnowlsnest/*
+    cmds:
+      - go mod tidy
+
+  lint:
+    cmds:
+      - go vet ./...
+      - go fmt ./...
+      - goimports -l -e -w .
+      - golangci-lint run --fix
+
+  build:
+    cmds:
+      - go build ./...
+
+  test:
+    cmds:
+      - go clean -testcache
+      - go test -v -race -timeout 5m ./...
