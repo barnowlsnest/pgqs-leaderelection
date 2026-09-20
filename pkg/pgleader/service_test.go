@@ -24,7 +24,7 @@ const (
 	testRetry  = 50 * time.Millisecond
 	testWait   = 10 * time.Second
 	testTick   = 10 * time.Millisecond
-	testSchema = "public"
+	testSchema = "pgqs"
 	testTable  = "leases"
 
 	// incumbent is the identity that mustAcquire installs as the current holder.
@@ -123,7 +123,7 @@ func (s *ServiceSuite) TearDownSuite() {
 }
 
 func (s *ServiceSuite) SetupTest() {
-	_, err := s.pool.Exec(s.T().Context(), `TRUNCATE `+testTable)
+	_, err := s.pool.Exec(s.T().Context(), `TRUNCATE `+testSchema+`.`+testTable)
 	s.Require().NoError(err)
 
 	s.clock = newTestClock()
