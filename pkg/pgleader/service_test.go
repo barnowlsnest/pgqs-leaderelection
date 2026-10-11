@@ -75,6 +75,7 @@ func (s *signal) fire() {
 type ServiceSuite struct {
 	suite.Suite
 	container *tcpostgres.PostgresContainer
+	connStr   string
 	pool      *pgxpool.Pool
 	repo      *pgleader.LeaseRepo
 	clock     *testClock
@@ -98,6 +99,7 @@ func (s *ServiceSuite) SetupSuite() {
 
 	connStr, err := ctr.ConnectionString(ctx, "sslmode=disable")
 	s.Require().NoError(err)
+	s.connStr = connStr
 
 	s.Require().NoError(database.RollOut(ctx, connStr))
 
@@ -127,6 +129,11 @@ func (s *ServiceSuite) SetupTest() {
 	s.Require().NoError(err)
 
 	s.clock = newTestClock()
+}
+
+// A restarted service rolls out against a database that is already migrated.
+func (s *ServiceSuite) TestRollOutOnMigratedDatabase() {
+	s.Require().NoError(database.RollOut(s.T().Context(), s.connStr))
 }
 
 // newService builds a Service on the shared pool and repo, driven by the
