@@ -85,7 +85,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	leases, err := pgleader.NewLeaseRepo(db.NewBaseDAO[pgleader.LeaseRecord]("public", "leases", pool))
+	leases, err := pgleader.NewLeaseRepo(db.NewBaseDAO[pgleader.LeaseRecord]("pgqs", "leases", pool))
 	if err != nil {
 		panic(err)
 	}
