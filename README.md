@@ -18,6 +18,10 @@ svc.Run(ctx, "nightly-report", pgleader.Callbacks{
 
 ## How it works
 
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="Animated diagram: processes A, B and C campaign for one lease. A takes the advisory lock, writes the lease row and becomes leader; B and C are refused while the lease is valid; A renews, then crashes; the lease expires and B takes over." width="820">
+</p>
+
 Two Postgres primitives, each doing the job it is good at:
 
 - **A `leases` row** holds the durable state: who the holder is, when the lease expires. It survives restarts, so a new process learns the current leader by reading one row.
@@ -34,6 +38,11 @@ go get github.com/barnowlsnest/pgqs-leaderelection
 ```
 
 Requires Go 1.27+ and PostgreSQL.
+
+## Built on
+
+- **[pgqs-harness](https://github.com/barnowlsnest/pgqs-harness)** — the Postgres connection pool (`postgres.NewPool`), the generic DAO behind `LeaseRepo` (`db.NewBaseDAO`), and the migration runner behind `database.RollOut` / `RollDown`.
+- **[go-logslib](https://github.com/barnowlsnest/go-logslib)** — the shared logger (`sharedlog`), the same one pgqs-harness uses. Errors the library cannot return to you — failed acquires and renewals in the `Run` loop, the lease release on shutdown, deferred advisory-lock unlocks — are logged through it.
 
 ## Quickstart
 
